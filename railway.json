@@ -1,0 +1,6 @@
+{
+  "build": {
+    "cmd": "apt update && apt install -y ffmpeg python3 python3-pip && pip install yt-dlp && npm install"
+  },
+  "start": "node index.js"
+}
