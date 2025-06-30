@@ -3,6 +3,8 @@
   "version": "1.0.0",
   "description": "��#\u0000 \u0000b\u0000e\u0000k\u0000-\u0000d\u0000o\u0000w\u0000n\u0000l\u0000o\u0000a\u0000d\u0000e\u0000r\u0000\r\u0000 \u0000",
   "main": "server.js",
+  "type": "module",
+
   "scripts": {
     "postinstall": "curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o yt-dlp && chmod +x yt-dlp",
     "test": "echo \"Error: no test specified\" && exit 1",
