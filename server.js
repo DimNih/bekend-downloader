@@ -21,11 +21,22 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 const DOWNLOADS_DIR = path.join('/tmp', 'downloads');
-const ytDlpPath = 'yt-dlp'; // Pakai yt-dlp global atau dari nix
+const COOKIES_PATH = path.join(__dirname, 'cookies', 'youtube_cookies.txt'); // Path ke file cookies
+const ytDlpPath = 'yt-dlp'; // Pastikan yt-dlp terinstal
 
 if (!fs.existsSync(DOWNLOADS_DIR)) {
   fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
   console.log(`[INFO] Folder download dibuat di ${DOWNLOADS_DIR}`);
+}
+
+// Tulis cookies dari env ke file jika ada
+if (process.env.YOUTUBE_COOKIES) {
+  const cookiesDir = path.dirname(COOKIES_PATH);
+  if (!fs.existsSync(cookiesDir)) {
+    fs.mkdirSync(cookiesDir, { recursive: true });
+  }
+  fs.writeFileSync(COOKIES_PATH, process.env.YOUTUBE_COOKIES);
+  console.log(`[INFO] File cookies ditulis di ${COOKIES_PATH}`);
 }
 
 const execAsync = promisify(exec);
@@ -37,7 +48,6 @@ const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_REDIRECT_URI
 );
 
-// Set kredensial dari .env
 oauth2Client.setCredentials({
   access_token: process.env.GOOGLE_ACCESS_TOKEN,
   refresh_token: process.env.GOOGLE_REFRESH_TOKEN,
@@ -46,16 +56,13 @@ oauth2Client.setCredentials({
   expiry_date: parseInt(process.env.GOOGLE_EXPIRY_DATE),
 });
 
-// Refresh token jika expired
 oauth2Client.on('tokens', (tokens) => {
   if (tokens.refresh_token) {
     console.log('[INFO] Refresh token diperbarui:', tokens.refresh_token);
-    // Simpan refresh token baru ke file .env atau database jika perlu
   }
   console.log('[INFO] Access token diperbarui:', tokens.access_token);
 });
 
-// Inisialisasi YouTube API
 const youtube = google.youtube({
   version: 'v3',
   auth: oauth2Client,
@@ -63,11 +70,11 @@ const youtube = google.youtube({
 
 const sanitizeFilename = (filename) => {
   return filename
-    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_') // karakter ilegal
-    .replace(/[\u{1F600}-\u{1F6FF}\u{2600}-\u{27BF}]/gu, '') // emoji & simbol
-    .replace(/\s+/g, '_') // spasi jadi _
-    .replace(/\.(mp3|mp4)$/i, '') // hapus ekstensi
-    .substring(0, 150); // batasi panjang
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+    .replace(/[\u{1F600}-\u{1F6FF}\u{2600}-\u{27BF}]/gu, '')
+    .replace(/\s+/g, '_')
+.replace(/\.(mp3|mp4)$/i, '')
+    .substring(0, 150);
 };
 
 const resolveRedirect = async (url) => {
@@ -100,7 +107,6 @@ app.post('/api/video-info', async (req, res) => {
   const videoId = new URL(url).searchParams.get('v') || url.split('/').pop();
 
   try {
-    // Cek autentikasi YouTube
     const videoResponse = await youtube.videos.list({
       part: 'snippet,contentDetails,statistics',
       id: videoId,
@@ -111,14 +117,12 @@ app.post('/api/video-info', async (req, res) => {
       return res.status(404).json({ error: 'Video tidak ditemukan' });
     }
 
-    const command = `${ytDlpPath} --dump-json --no-warnings "${url}"`;
+    // Gunakan --get-url untuk mendapatkan URL streaming langsung
+    const command = `${ytDlpPath} --dump-json --no-warnings --cookies "${COOKIES_PATH}" "${url}"`;
     console.log(`[INFO] Menjalankan command: ${command}`);
 
     const { stdout } = await execAsync(command, { maxBuffer: 1024 * 1024 * 20 });
     const data = JSON.parse(stdout);
-
-    console.log(`[INFO] Berhasil mendapatkan info: ${data.title}`);
-
     const formats = [];
     const videoQualities = new Set();
     const duration = data.duration || 0;
@@ -172,16 +176,27 @@ app.post('/api/video-info', async (req, res) => {
       });
     }
 
+    // Pilih format preview yang lebih andal
     const previewFormat = data.formats.find(
-      (f) => f.vcodec !== 'none' && f.acodec !== 'none' && f.ext === 'mp4' && f.filesize && f.filesize < 5 * 1024 * 1024
+      (f) => f.vcodec !== 'none' && f.acodec !== 'none' && f.ext === 'mp4' && f.height <= 360
     );
 
-    const previewUrl = previewFormat ? previewFormat.url : '';
+    let previewUrl = '';
+    if (previewFormat) {
+      // Gunakan --get-url untuk mendapatkan URL streaming yang valid
+      const previewCommand = `${ytDlpPath} --get-url -f ${previewFormat.format_id} --cookies "${COOKIES_PATH}" "${url}"`;
+      try {
+        const { stdout: previewUrlOutput } = await execAsync(previewCommand);
+        previewUrl = previewUrlOutput.trim();
+      } catch (err) {
+        console.error(`[ERROR] Gagal mendapatkan preview URL: ${err.message}`);
+      }
+    }
 
     res.json({
       title: videoData.snippet.title || data.title || 'Unknown Title',
       thumbnail: videoData.snippet.thumbnails.high.url || data.thumbnail || '',
-      previewUrl: previewUrl,
+      previewUrl: previewUrl || data.thumbnail, // Fallback ke thumbnail jika preview gagal
       duration: videoData.contentDetails.duration
         ? videoData.contentDetails.duration
         : duration
@@ -211,8 +226,8 @@ app.post('/api/download', async (req, res) => {
   );
 
   const command = type === 'audio'
-    ? `${ytDlpPath} --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" --extract-audio --audio-format mp3 -o "${outputFilePath}" "${url}"`
-    : `${ytDlpPath} --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -f "bestvideo[height<=${parseInt(quality)}]+bestaudio/best" --merge-output-format mp4 -o "${outputFilePath}" "${url}"`;
+    ? `${ytDlpPath} --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" --extract-audio --audio-format mp3 --cookies "${COOKIES_PATH}" -o "${outputFilePath}" "${url}"`
+    : `${ytDlpPath} --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -f "bestvideo[height<=${parseInt(quality)}]+bestaudio/best" --merge-output-format mp4 --cookies "${COOKIES_PATH}" -o "${outputFilePath}" "${url}"`;
 
   console.log(`[INFO] Menjalankan command download: ${command}`);
 
@@ -262,9 +277,7 @@ app.get('/oauth2callback', async (req, res) => {
     const { tokens } = await oauth2Client.getToken(code);
     oauth2Client.setCredentials(tokens);
     console.log('[INFO] Token berhasil diperoleh:', tokens);
-
-    // Simpan tokens ke file .env atau database jika perlu
-    res.redirect('/'); // Redirect ke halaman utama atau halaman sukses
+    res.redirect('/');
   } catch (err) {
     console.error(`[ERROR] Gagal menangani OAuth2 callback: ${err.message}`);
     res.status(500).json({ error: 'Gagal autentikasi', details: err.message });
