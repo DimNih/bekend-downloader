@@ -16,8 +16,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 const DOWNLOADS_DIR = path.join('/tmp', 'downloads');
-const ytDlpPath = 'yt-dlp'; //Pakai yt-dlp nixpath
-
+const ytDlpPath = 'yt-dlp'; // Pakai yt-dlp dari nix atau path global
 
 if (!fs.existsSync(DOWNLOADS_DIR)) {
   fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
@@ -27,7 +26,17 @@ if (!fs.existsSync(DOWNLOADS_DIR)) {
 const execAsync = promisify(exec);
 
 const sanitizeFilename = (filename) => {
-  return filename.replace(/[<>:"/\\|?*\x00-\x1F]/g, '_').replace(/\.(mp3|mp4)$/, '');
+  return filename
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_') // karakter ilegal Windows
+    .replace(/[\u{1F600}-\u{1F64F}]/gu, '')  // emoji faces
+    .replace(/[\u{1F300}-\u{1F5FF}]/gu, '')  // simbol
+    .replace(/[\u{1F680}-\u{1F6FF}]/gu, '')  // transport
+    .replace(/[\u{2600}-\u{26FF}]/gu, '')    // misc simbol
+    .replace(/[\u{2700}-\u{27BF}]/gu, '')    // dingbats
+    .replace(/[\u{1F900}-\u{1F9FF}]/gu, '')  // tambahan emoji
+    .replace(/\s+/g, '_')                    // spasi jadi underscore
+    .replace(/\.(mp3|mp4)$/i, '')             // hapus ekstensi
+    .substring(0, 150);                      // batasi panjang
 };
 
 const resolveRedirect = async (url) => {
@@ -163,7 +172,7 @@ app.post('/api/download', async (req, res) => {
     res.setHeader('Content-Type', type === 'audio' ? 'audio/mpeg' : 'video/mp4');
     res.setHeader(
       'Content-Disposition',
-      `attachment; filename="${sanitizedFilename}.${type === 'audio' ? 'mp3' : 'mp4'}"`
+      `attachment; filename="${encodeURIComponent(sanitizedFilename)}.${type === 'audio' ? 'mp3' : 'mp4'}"`
     );
 
     console.log(`[INFO] Mulai mengirim file ${outputFilePath} ke client`);
