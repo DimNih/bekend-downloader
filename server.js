@@ -17,7 +17,7 @@ app.use(express.urlencoded({ extended: true }));
 
 const DOWNLOADS_DIR = path.join('/tmp', 'downloads');
 const ytDlpPath = 'yt-dlp';
-const COOKIES_PATH = path.join(__dirname, 'cookies.txt');
+const COOKIES_PATH = path.join(__dirname, 'youtube.com_cookies.txt');
 
 if (!fs.existsSync(DOWNLOADS_DIR)) {
   fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
@@ -42,14 +42,7 @@ const sanitizeFilename = (filename) => {
 
 const resolveRedirect = async (url) => {
   try {
-    const response = await axios.head(url, {
-      maxRedirects: 0,
-      validateStatus: null,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Referer': 'https://www.instagram.com/',
-      },
-    });
+    const response = await axios.head(url, { maxRedirects: 0, validateStatus: null });
     if (response.status >= 300 && response.status < 400 && response.headers.location) {
       return response.headers.location;
     }
@@ -65,7 +58,6 @@ const validateThumbnail = async (thumbnailUrl) => {
     const response = await axios.head(thumbnailUrl, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Referer': 'https://www.instagram.com/',
       },
       timeout: 5000,
     });
@@ -87,82 +79,15 @@ const estimateFileSize = (bitrateKbps, durationSeconds) => {
   return sizeInMB.toFixed(2) + 'MB';
 };
 
-const detectPlatform = (url) => {
-  if (/youtube\.com|youtu\.be/.test(url)) return 'youtube';
-  if (/tiktok\.com|vt\.tiktok\.com/.test(url)) return 'tiktok';
-  if (/instagram\.com/.test(url)) return 'instagram';
-  if (/facebook\.com|fb\.com/.test(url)) return 'facebook';
-  return 'unknown';
-};
-
-const getCookiesHeader = () => {
-  if (!fs.existsSync(COOKIES_PATH)) {
-    console.warn(`[WARN] Cookies file not found at ${COOKIES_PATH}`);
-    return null;
-  }
-  const cookiesContent = fs.readFileSync(COOKIES_PATH, 'utf8');
-  const cookies = cookiesContent
-    .split('\n')
-    .filter((line) => line && !line.startsWith('#'))
-    .map((line) => {
-      const parts = line.split('\t');
-      if (parts.length >= 7) {
-        return `${parts[5]}=${parts[6]}`;
-      }
-      return null;
-    })
-    .filter(Boolean)
-    .join('; ');
-  return cookies || null;
-};
-
-app.get('/api/proxy-stream', async (req, res) => {
-  const { url } = req.query;
-  if (!url) {
-    return res.status(400).json({ error: 'Stream URL is required' });
-  }
-
-  console.log(`[INFO] Proxying stream: ${url}`);
-
-  try {
-    const headers = {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-      'Referer': 'https://www.instagram.com/',
-    };
-
-    const cookies = getCookiesHeader();
-    if (cookies) {
-      headers['Cookie'] = cookies;
-    }
-
-    const response = await axios.get(url, {
-      responseType: 'stream',
-      headers,
-      timeout: 10000,
-    });
-
-    res.set({
-      'Content-Type': response.headers['content-type'] || 'application/x-mpegURL',
-      'Access-Control-Allow-Origin': '*',
-    });
-
-    response.data.pipe(res);
-  } catch (err) {
-    console.error(`[ERROR] Proxy stream failed: ${err.message}`);
-    res.status(500).json({ error: 'Failed to proxy stream', details: err.message });
-  }
-});
-
+// API: Get video info
 app.post('/api/video-info', async (req, res) => {
   let { url } = req.body;
   if (!url) return res.status(400).json({ error: 'URL diperlukan' });
 
   url = await resolveRedirect(url);
-  const platform = detectPlatform(url);
   const cookiesOption = fs.existsSync(COOKIES_PATH) ? `--cookies "${COOKIES_PATH}"` : '';
   const command = `${ytDlpPath} ${cookiesOption} --dump-json --no-warnings "${url}"`;
 
-  console.log(`[INFO] Platform detected: ${platform}`);
   console.log(`[INFO] Executing command: ${command}`);
 
   try {
@@ -178,53 +103,16 @@ app.post('/api/video-info', async (req, res) => {
     const videoQualities = new Set();
     const duration = data.duration || 0;
 
-    let bestVideoFormat = null;
-    if (platform === 'tiktok' || platform === 'instagram') {
-      try {
-        const mp4Command = `${ytDlpPath} ${cookiesOption} -f "best[ext=mp4]" --get-url "${url}"`;
-        console.log(`[INFO] Attempting to fetch MP4 URL: ${mp4Command}`);
-        const { stdout: mp4Url } = await execAsync(mp4Command);
-        if (mp4Url && mp4Url.trim()) {
-          bestVideoFormat = { url: mp4Url.trim(), ext: 'mp4', protocol: 'https' };
-          console.log(`[INFO] Direct MP4 URL fetched: ${mp4Url.trim()}`);
-        } else {
-          console.warn(`[WARN] No valid MP4 URL returned by yt-dlp`);
-        }
-      } catch (mp4Err) {
-        console.warn(`[WARN] Failed to fetch direct MP4 for ${platform}: ${mp4Err.message}`);
-      }
-    }
-
-    if (!bestVideoFormat) {
-      bestVideoFormat = data.formats
-        .filter(
-          (f) =>
-            f.vcodec !== 'none' &&
-            f.url &&
-            f.ext === 'mp4' &&
-            (f.protocol === 'https' || f.protocol === 'http')
-        )
-        .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
-
-      if (!bestVideoFormat && (platform === 'tiktok' || platform === 'instagram')) {
-        bestVideoFormat = data.formats
-          .filter((f) => f.vcodec !== 'none' && f.url && f.ext === 'mp4' && f.protocol.includes('m3u8'))
-          .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
-      }
-    }
-
-    let previewUrl = bestVideoFormat?.url || data.webpage_url || url;
-    if (platform === 'tiktok' || platform === 'instagram') {
-      if (previewUrl.includes('.m3u8')) {
-        previewUrl = `http://localhost:8080/api/proxy-stream?url=${encodeURIComponent(previewUrl)}`;
-        console.log(`[INFO] Proxied HLS previewUrl: ${previewUrl}`);
-      } else {
-        console.log(`[INFO] Using direct previewUrl: ${previewUrl}`);
-      }
-    }
-
-    // Validate thumbnail
-    const thumbnail = await validateThumbnail(data.thumbnail);
+    // Select the best video format for preview (prioritize MP4 with HTTP/HTTPS protocol)
+    const bestVideoFormat = data.formats
+      .filter(
+        (f) =>
+          f.vcodec !== 'none' &&
+          f.url &&
+          f.ext === 'mp4' &&
+          (f.protocol === 'https' || f.protocol === 'http')
+      )
+      .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
 
     data.formats
       .filter((f) => f.vcodec !== 'none' && f.height)
@@ -277,11 +165,10 @@ app.post('/api/video-info', async (req, res) => {
 
     res.json({
       title: data.title || 'Unknown Title',
-      thumbnail,
+      thumbnail: await validateThumbnail(data.thumbnail), // Updated to use validateThumbnail
       duration: duration ? new Date(duration * 1000).toISOString().substr(11, 8) : '00:00:00',
       formats,
-      previewUrl,
-      platform,
+      previewUrl: bestVideoFormat?.url || data.webpage_url || url, // Fallback to webpage_url if no streamable URL
     });
   } catch (err) {
     console.error(`[ERROR] Failed to fetch video info: ${err.message}`);
@@ -290,6 +177,7 @@ app.post('/api/video-info', async (req, res) => {
   }
 });
 
+// API: Download video/audio
 app.post('/api/download', async (req, res) => {
   const { url, filename, type, quality } = req.body;
   if (!url || !filename || !type || !quality) {
@@ -346,6 +234,7 @@ app.post('/api/download', async (req, res) => {
   }
 });
 
+// Start server
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`🚀 Server running at http://localhost:${PORT}`);
