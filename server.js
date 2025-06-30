@@ -16,21 +16,27 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 const DOWNLOADS_DIR = path.join('/tmp', 'downloads');
-const ytDlpPath = 'yt-dlp';
+const ytDlpPath = 'yt-dlp'; // Pakai yt-dlp dari nix atau path global
 
 if (!fs.existsSync(DOWNLOADS_DIR)) {
   fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
+  console.log(`[INFO] Folder download dibuat di ${DOWNLOADS_DIR}`);
 }
 
 const execAsync = promisify(exec);
 
 const sanitizeFilename = (filename) => {
   return filename
-    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
-    .replace(/[\u{1F600}-\u{1F6FF}\u{2600}-\u{27BF}]/gu, '')
-    .replace(/\s+/g, '_')
-    .replace(/\.(mp3|mp4)$/i, '')
-    .substring(0, 150);
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_') // karakter ilegal Windows
+    .replace(/[\u{1F600}-\u{1F64F}]/gu, '')  // emoji faces
+    .replace(/[\u{1F300}-\u{1F5FF}]/gu, '')  // simbol
+    .replace(/[\u{1F680}-\u{1F6FF}]/gu, '')  // transport
+    .replace(/[\u{2600}-\u{26FF}]/gu, '')    // misc simbol
+    .replace(/[\u{2700}-\u{27BF}]/gu, '')    // dingbats
+    .replace(/[\u{1F900}-\u{1F9FF}]/gu, '')  // tambahan emoji
+    .replace(/\s+/g, '_')                    // spasi jadi underscore
+    .replace(/\.(mp3|mp4)$/i, '')             // hapus ekstensi
+    .substring(0, 150);                      // batasi panjang
 };
 
 const resolveRedirect = async (url) => {
@@ -52,7 +58,9 @@ const estimateFileSize = (bitrateKbps, durationSeconds) => {
   return sizeInMB.toFixed(2) + 'MB';
 };
 
-// 🔥 API Info Video
+// ==========================================
+// ✅ API: Get video info
+// ==========================================
 app.post('/api/video-info', async (req, res) => {
   let { url } = req.body;
   if (!url) return res.status(400).json({ error: 'URL diperlukan' });
@@ -60,9 +68,13 @@ app.post('/api/video-info', async (req, res) => {
   url = await resolveRedirect(url);
   const command = `${ytDlpPath} --dump-json --no-warnings "${url}"`;
 
+  console.log(`[INFO] Menjalankan command: ${command}`);
+
   try {
     const { stdout } = await execAsync(command, { maxBuffer: 1024 * 1024 * 20 });
     const data = JSON.parse(stdout);
+
+    console.log(`[INFO] Berhasil mendapatkan info: ${data.title}`);
 
     const formats = [];
     const videoQualities = new Set();
@@ -117,25 +129,21 @@ app.post('/api/video-info', async (req, res) => {
       });
     }
 
-    const previewFormat = data.formats.find(
-      (f) => f.vcodec !== 'none' && f.acodec !== 'none' && f.ext === 'mp4' && f.filesize && f.filesize < 5 * 1024 * 1024
-    );
-
-    const previewUrl = previewFormat ? previewFormat.url : '';
-
     res.json({
       title: data.title || 'Unknown Title',
       thumbnail: data.thumbnail || '',
-      previewUrl: previewUrl,
       duration: duration ? new Date(duration * 1000).toISOString().substr(11, 8) : '00:00:00',
       formats,
     });
   } catch (err) {
+    console.error(`[ERROR] Gagal mengambil info video: ${err.message}`);
     res.status(500).json({ error: 'Gagal mengambil info video', details: err.message });
   }
 });
 
-// 🔥 API Download
+// ==========================================
+// ✅ API: Download video/audio
+// ==========================================
 app.post('/api/download', async (req, res) => {
   const { url, filename, type, quality } = req.body;
   if (!url || !filename || !type || !quality) {
@@ -149,8 +157,10 @@ app.post('/api/download', async (req, res) => {
   );
 
   const command = type === 'audio'
-    ? `${ytDlpPath} --extract-audio --audio-format mp3 -o "${outputFilePath}" "${url}"`
-    : `${ytDlpPath} -f "bestvideo[height<=${parseInt(quality)}]+bestaudio/best" --merge-output-format mp4 -o "${outputFilePath}" "${url}"`;
+    ? `${ytDlpPath} --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" --extract-audio --audio-format mp3 -o "${outputFilePath}" "${url}"`
+    : `${ytDlpPath} --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -f "bestvideo[height<=${parseInt(quality)}]+bestaudio/best/best" --merge-output-format mp4 -o "${outputFilePath}" "${url}"`;
+
+  console.log(`[INFO] Menjalankan command download: ${command}`);
 
   try {
     await execAsync(command);
@@ -165,43 +175,28 @@ app.post('/api/download', async (req, res) => {
       `attachment; filename="${encodeURIComponent(sanitizedFilename)}.${type === 'audio' ? 'mp3' : 'mp4'}"`
     );
 
+    console.log(`[INFO] Mulai mengirim file ${outputFilePath} ke client`);
+
     fileStream.pipe(res);
 
     fileStream.on('end', () => {
+      console.log(`[INFO] File ${outputFilePath} berhasil dikirim dan dihapus.`);
       fs.unlink(outputFilePath, () => {});
     });
 
     fileStream.on('error', (err) => {
+      console.error(`[ERROR] Gagal mengirim file: ${err.message}`);
       res.status(500).json({ error: 'Gagal mengirim file', details: err.message });
     });
   } catch (err) {
+    console.error(`[ERROR] Gagal download: ${err.message}`);
     res.status(500).json({ error: 'Gagal download', details: err.message });
   }
 });
 
-// 🔥 API Stream Preview
-app.get('/api/stream-preview', async (req, res) => {
-  const { url } = req.query;
-  if (!url) return res.status(400).send('URL diperlukan');
-
-  try {
-    const response = await axios({
-      method: 'get',
-      url,
-      responseType: 'stream',
-      headers: {
-        'User-Agent': 'Mozilla/5.0'
-      }
-    });
-
-    res.setHeader('Content-Type', response.headers['content-type'] || 'video/mp4');
-    response.data.pipe(res);
-  } catch (err) {
-    res.status(500).send('Gagal memuat preview');
-  }
-});
-
-// 🔥 Run Server
+// ==========================================
+// ✅ Jalankan server
+// ==========================================
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`🚀 Server berjalan di http://localhost:${PORT}`);
