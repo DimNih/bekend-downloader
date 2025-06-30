@@ -1,4 +1,3 @@
-
 import express from 'express';
 import { promisify } from 'util';
 import { exec } from 'child_process';
@@ -7,10 +6,6 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import axios from 'axios';
-import { google } from 'googleapis';
-import dotenv from 'dotenv';
-
-dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -25,36 +20,8 @@ const ytDlpPath = path.join(__dirname, 'yt-dlp');
 
 if (!fs.existsSync(DOWNLOADS_DIR)) {
   fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
+  console.log(`[INFO] Folder download dibuat di ${DOWNLOADS_DIR}`);
 }
-
-// === Google API Setup ===
-const youtube = google.youtube({
-  version: 'v3',
-  auth: process.env.GOOGLE_API_KEY,
-});
-
-// === OAuth2 Setup ===
-const oauth2Client = new google.auth.OAuth2(
-  process.env.GOOGLE_CLIENT_ID,
-  process.env.GOOGLE_CLIENT_SECRET,
-  process.env.GOOGLE_REDIRECT_URI
-);
-
-// Set token langsung dari env
-oauth2Client.setCredentials({
-  access_token: process.env.GOOGLE_ACCESS_TOKEN,
-  refresh_token: process.env.GOOGLE_REFRESH_TOKEN,
-  scope: process.env.GOOGLE_SCOPE,
-  token_type: process.env.GOOGLE_TOKEN_TYPE,
-  expiry_date: parseInt(process.env.GOOGLE_EXPIRY_DATE),
-});
-
-// URL Auth (jika mau refresh token)
-const authUrl = oauth2Client.generateAuthUrl({
-  access_type: 'offline',
-  scope: ['https://www.googleapis.com/auth/youtube.readonly'],
-});
-console.log('Buka URL ini untuk autentikasi OAuth (jika diperlukan):', authUrl);
 
 const execAsync = promisify(exec);
 
@@ -81,76 +48,92 @@ const estimateFileSize = (bitrateKbps, durationSeconds) => {
   return sizeInMB.toFixed(2) + 'MB';
 };
 
-// === API: OAuth Callback ===
-app.get('/oauth2callback', async (req, res) => {
-  const { code } = req.query;
-  if (!code) return res.status(400).send('Code diperlukan untuk autentikasi.');
-
-  try {
-    const { tokens } = await oauth2Client.getToken(code);
-    oauth2Client.setCredentials(tokens);
-    res.send(`Autentikasi berhasil. Token:\n\n${JSON.stringify(tokens, null, 2)}`);
-  } catch (err) {
-    res.status(500).send('Gagal autentikasi: ' + err.message);
-  }
-});
-
-// === API: Video Info ===
+// ==========================================
+// ✅ API: Get video info
+// ==========================================
 app.post('/api/video-info', async (req, res) => {
   let { url } = req.body;
   if (!url) return res.status(400).json({ error: 'URL diperlukan' });
 
   url = await resolveRedirect(url);
-  let videoId;
-  try {
-    const urlObj = new URL(url);
-    videoId = urlObj.searchParams.get('v') || url.split('/').pop();
-  } catch {
-    return res.status(400).json({ error: 'URL tidak valid' });
-  }
+  const command = `${ytDlpPath} --dump-json --no-warnings "${url}"`;
+
+  console.log(`[INFO] Menjalankan command: ${command}`);
 
   try {
-    let response = await youtube.videos.list({
-      part: ['snippet', 'contentDetails', 'status'],
-      id: [videoId],
-      auth: process.env.GOOGLE_API_KEY,
-    });
+    const { stdout } = await execAsync(command, { maxBuffer: 1024 * 1024 * 20 });
+    const data = JSON.parse(stdout);
 
-    if (!response.data.items.length) {
-      response = await youtube.videos.list({
-        part: ['snippet', 'contentDetails', 'status'],
-        id: [videoId],
-        auth: oauth2Client,
+    console.log(`[INFO] Berhasil mendapatkan info: ${data.title}`);
+
+    const formats = [];
+    const videoQualities = new Set();
+    const duration = data.duration || 0;
+
+    data.formats
+      .filter((f) => f.vcodec !== 'none' && f.height)
+      .sort((a, b) => b.height - a.height)
+      .forEach((f) => {
+        const quality = `${f.height}p`;
+        if (!videoQualities.has(quality)) {
+          let size;
+          if (f.filesize) {
+            size = (f.filesize / (1024 * 1024)).toFixed(2) + 'MB';
+          } else if (f.tbr && duration) {
+            size = estimateFileSize(f.tbr, duration);
+          } else {
+            size = 'Unknown Size';
+          }
+
+          formats.push({
+            quality,
+            format: 'MP4',
+            size,
+            url: data.webpage_url || url,
+            type: 'video',
+          });
+          videoQualities.add(quality);
+        }
       });
 
-      if (!response.data.items.length) {
-        return res.status(404).json({ error: 'Video tidak ditemukan' });
+    const bestAudio = data.formats
+      .filter((f) => f.acodec !== 'none')
+      .sort((a, b) => (b.abr || 0) - (a.abr || 0) || (b.filesize || 0) - (a.filesize || 0))[0];
+
+    if (bestAudio) {
+      let audioSize;
+      if (bestAudio.filesize) {
+        audioSize = (bestAudio.filesize / (1024 * 1024)).toFixed(2) + 'MB';
+      } else if (bestAudio.abr && duration) {
+        audioSize = estimateFileSize(bestAudio.abr, duration);
+      } else {
+        audioSize = 'Unknown Size';
       }
+
+      formats.push({
+        quality: 'Best Audio',
+        format: 'MP3',
+        size: audioSize,
+        url: data.webpage_url || url,
+        type: 'audio',
+      });
     }
 
-    const video = response.data.items[0];
-    const duration = video.contentDetails.duration;
-    const durationSeconds = parseDuration(duration);
-    const formats = [
-      { quality: '1080p', format: 'MP4', size: estimateFileSize(5000, durationSeconds), type: 'video', url },
-      { quality: '720p', format: 'MP4', size: estimateFileSize(3000, durationSeconds), type: 'video', url },
-      { quality: '480p', format: 'MP4', size: estimateFileSize(1500, durationSeconds), type: 'video', url },
-      { quality: 'Best Audio', format: 'MP3', size: 'Auto Convert', type: 'audio', url }
-    ];
-
     res.json({
-      title: video.snippet.title,
-      thumbnail: video.snippet.thumbnails.high.url,
-      duration: durationSeconds ? new Date(durationSeconds * 1000).toISOString().substr(11, 8) : '00:00:00',
+      title: data.title || 'Unknown Title',
+      thumbnail: data.thumbnail || '',
+      duration: duration ? new Date(duration * 1000).toISOString().substr(11, 8) : '00:00:00',
       formats,
-      previewUrl: url,
     });
   } catch (err) {
-    res.status(500).json({ error: 'Gagal mengambil informasi video', details: err.message });
+    console.error(`[ERROR] Gagal mengambil info video: ${err.message}`);
+    res.status(500).json({ error: 'Gagal mengambil info video', details: err.message });
   }
 });
 
-// === API: Download ===
+// ==========================================
+// ✅ API: Download video/audio
+// ==========================================
 app.post('/api/download', async (req, res) => {
   const { url, filename, type, quality } = req.body;
   if (!url || !filename || !type || !quality) {
@@ -164,39 +147,46 @@ app.post('/api/download', async (req, res) => {
   );
 
   const command = type === 'audio'
-    ? `${ytDlpPath} --extract-audio --audio-format mp3 -o "${outputFilePath}" "${url}"`
-    : `${ytDlpPath} -f "bestvideo[height<=${parseInt(quality) || 'best'}]+bestaudio/best" --merge-output-format mp4 -o "${outputFilePath}" "${url}"`;
+    ? `${ytDlpPath} --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" --extract-audio --audio-format mp3 -o "${outputFilePath}" "${url}"`
+    : `${ytDlpPath} --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -f "bestvideo[height<=${parseInt(quality)}]+bestaudio/best/best" --merge-output-format mp4 -o "${outputFilePath}" "${url}"`;
+
+  console.log(`[INFO] Menjalankan command download: ${command}`);
 
   try {
     await execAsync(command);
+
     const fileStream = fs.createReadStream(outputFilePath);
     const fileStats = fs.statSync(outputFilePath);
 
     res.setHeader('Content-Length', fileStats.size);
     res.setHeader('Content-Type', type === 'audio' ? 'audio/mpeg' : 'video/mp4');
-    res.setHeader('Content-Disposition', `attachment; filename="${sanitizedFilename}.${type === 'audio' ? 'mp3' : 'mp4'}"`);
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${sanitizedFilename}.${type === 'audio' ? 'mp3' : 'mp4'}"`
+    );
+
+    console.log(`[INFO] Mulai mengirim file ${outputFilePath} ke client`);
 
     fileStream.pipe(res);
 
-    fileStream.on('end', () => fs.unlink(outputFilePath, () => {}));
+    fileStream.on('end', () => {
+      console.log(`[INFO] File ${outputFilePath} berhasil dikirim dan dihapus.`);
+      fs.unlink(outputFilePath, () => {});
+    });
+
     fileStream.on('error', (err) => {
+      console.error(`[ERROR] Gagal mengirim file: ${err.message}`);
       res.status(500).json({ error: 'Gagal mengirim file', details: err.message });
     });
   } catch (err) {
-    res.status(500).json({ error: 'Gagal mengunduh', details: err.message });
+    console.error(`[ERROR] Gagal download: ${err.message}`);
+    res.status(500).json({ error: 'Gagal download', details: err.message });
   }
 });
 
-// === Duration Parser ===
-function parseDuration(duration) {
-  const match = duration.match(/PT(\d+H)?(\d+M)?(\d+S)?/);
-  const hours = (match[1] ? parseInt(match[1]) : 0) || 0;
-  const minutes = (match[2] ? parseInt(match[2]) : 0) || 0;
-  const seconds = (match[3] ? parseInt(match[3]) : 0) || 0;
-  return hours * 3600 + minutes * 60 + seconds;
-}
-
-// === Start Server ===
+// ==========================================
+// ✅ Jalankan server
+// ==========================================
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`🚀 Server berjalan di http://localhost:${PORT}`);
