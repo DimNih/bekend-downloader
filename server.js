@@ -16,7 +16,8 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 const DOWNLOADS_DIR = path.join('/tmp', 'downloads');
-const ytDlpPath = path.join(__dirname, 'yt-dlp');
+const ytDlpPath = 'yt-dlp'; //Pakai yt-dlp nixpath
+
 
 if (!fs.existsSync(DOWNLOADS_DIR)) {
   fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
