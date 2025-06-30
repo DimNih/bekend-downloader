@@ -16,7 +16,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 const DOWNLOADS_DIR = path.join('/tmp', 'downloads');
-const ytDlpPath = 'yt-dlp'; // Pakai yt-dlp dari nix atau path global
+const ytDlpPath = 'yt-dlp'; // Pakai yt-dlp global atau dari nix
 
 if (!fs.existsSync(DOWNLOADS_DIR)) {
   fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
@@ -27,16 +27,11 @@ const execAsync = promisify(exec);
 
 const sanitizeFilename = (filename) => {
   return filename
-    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_') // karakter ilegal Windows
-    .replace(/[\u{1F600}-\u{1F64F}]/gu, '')  // emoji faces
-    .replace(/[\u{1F300}-\u{1F5FF}]/gu, '')  // simbol
-    .replace(/[\u{1F680}-\u{1F6FF}]/gu, '')  // transport
-    .replace(/[\u{2600}-\u{26FF}]/gu, '')    // misc simbol
-    .replace(/[\u{2700}-\u{27BF}]/gu, '')    // dingbats
-    .replace(/[\u{1F900}-\u{1F9FF}]/gu, '')  // tambahan emoji
-    .replace(/\s+/g, '_')                    // spasi jadi underscore
-    .replace(/\.(mp3|mp4)$/i, '')             // hapus ekstensi
-    .substring(0, 150);                      // batasi panjang
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_') // karakter ilegal
+    .replace(/[\u{1F600}-\u{1F6FF}\u{2600}-\u{27BF}]/gu, '') // emoji & simbol
+    .replace(/\s+/g, '_') // spasi jadi _
+    .replace(/\.(mp3|mp4)$/i, '') // hapus ekstensi
+    .substring(0, 150); // batasi panjang
 };
 
 const resolveRedirect = async (url) => {
@@ -59,7 +54,7 @@ const estimateFileSize = (bitrateKbps, durationSeconds) => {
 };
 
 // ==========================================
-// ✅ API: Get video info
+// ✅ API: Get video info (include preview)
 // ==========================================
 app.post('/api/video-info', async (req, res) => {
   let { url } = req.body;
@@ -129,9 +124,16 @@ app.post('/api/video-info', async (req, res) => {
       });
     }
 
+    const previewFormat = data.formats.find(
+      (f) => f.vcodec !== 'none' && f.acodec !== 'none' && f.ext === 'mp4' && f.filesize && f.filesize < 5 * 1024 * 1024
+    );
+
+    const previewUrl = previewFormat ? previewFormat.url : '';
+
     res.json({
       title: data.title || 'Unknown Title',
       thumbnail: data.thumbnail || '',
+      previewUrl: previewUrl,
       duration: duration ? new Date(duration * 1000).toISOString().substr(11, 8) : '00:00:00',
       formats,
     });
@@ -158,7 +160,7 @@ app.post('/api/download', async (req, res) => {
 
   const command = type === 'audio'
     ? `${ytDlpPath} --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" --extract-audio --audio-format mp3 -o "${outputFilePath}" "${url}"`
-    : `${ytDlpPath} --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -f "bestvideo[height<=${parseInt(quality)}]+bestaudio/best/best" --merge-output-format mp4 -o "${outputFilePath}" "${url}"`;
+    : `${ytDlpPath} --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -f "bestvideo[height<=${parseInt(quality)}]+bestaudio/best" --merge-output-format mp4 -o "${outputFilePath}" "${url}"`;
 
   console.log(`[INFO] Menjalankan command download: ${command}`);
 
