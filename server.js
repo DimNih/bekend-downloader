@@ -1,6 +1,6 @@
 import express from 'express';
 import { promisify } from 'util';
-import { exec } from 'child_process';
+import { exec, spawn } from 'child_process';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -15,14 +15,8 @@ app.use(cors({ origin: '*', methods: ['GET', 'POST'], allowedHeaders: ['Content-
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const DOWNLOADS_DIR = path.join('/tmp', 'downloads');
 const ytDlpPath = 'yt-dlp';
 const COOKIES_PATH = path.join(__dirname, 'youtube.com_cookies.txt');
-
-if (!fs.existsSync(DOWNLOADS_DIR)) {
-  fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
-  console.log(`[INFO] Download folder created at ${DOWNLOADS_DIR}`);
-}
 
 const execAsync = promisify(exec);
 
@@ -81,7 +75,7 @@ const estimateFileSize = (bitrateKbps, durationSeconds) => {
 
 // API: Get video info
 app.post('/api/video-info', async (req, res) => {
-  let { url } = req.body;
+  let { url } = req.body; 
   if (!url) return res.status(400).json({ error: 'URL diperlukan' });
 
   url = await resolveRedirect(url);
@@ -103,7 +97,6 @@ app.post('/api/video-info', async (req, res) => {
     const videoQualities = new Set();
     const duration = data.duration || 0;
 
-    // Select the best video format for preview (prioritize MP4 with HTTP/HTTPS protocol)
     const bestVideoFormat = data.formats
       .filter(
         (f) =>
@@ -165,10 +158,10 @@ app.post('/api/video-info', async (req, res) => {
 
     res.json({
       title: data.title || 'Unknown Title',
-      thumbnail: await validateThumbnail(data.thumbnail), // Updated to use validateThumbnail
+      thumbnail: await validateThumbnail(data.thumbnail),
       duration: duration ? new Date(duration * 1000).toISOString().substr(11, 8) : '00:00:00',
       formats,
-      previewUrl: bestVideoFormat?.url || data.webpage_url || url, // Fallback to webpage_url if no streamable URL
+      previewUrl: bestVideoFormat?.url || data.webpage_url || url,
     });
   } catch (err) {
     console.error(`[ERROR] Failed to fetch video info: ${err.message}`);
@@ -185,52 +178,53 @@ app.post('/api/download', async (req, res) => {
   }
 
   const sanitizedFilename = sanitizeFilename(filename);
-  const outputFilePath = path.join(
-    DOWNLOADS_DIR,
-    `${sanitizedFilename}.${type === 'audio' ? 'mp3' : 'mp4'}`
-  );
+  const fileExtension = type === 'audio' ? 'mp3' : 'mp4';
+  const contentType = type === 'audio' ? 'audio/mpeg' : 'video/mp4';
 
   const cookiesOption = fs.existsSync(COOKIES_PATH) ? `--cookies "${COOKIES_PATH}"` : '';
-  const command = type === 'audio'
-    ? `${ytDlpPath} ${cookiesOption} --extract-audio --audio-format mp3 -o "${outputFilePath}" "${url}"`
-    : `${ytDlpPath} ${cookiesOption} -f "best[height<=${parseInt(quality)}][ext=mp4]/best[ext=mp4]/best" --merge-output-format mp4 -o "${outputFilePath}" "${url}"`;
+  const commandArgs = type === 'audio'
+    ? [cookiesOption, '--extract-audio', '--audio-format', 'mp3', '-o', '-', url]
+    : [cookiesOption, '-f', `best[height<=${parseInt(quality)}][ext=mp4]/best[ext=mp4]/best`, '--merge-output-format', 'mp4', '-o', '-', url];
 
-  console.log(`[INFO] Executing download command: ${command}`);
+  // Filter out empty strings from commandArgs
+  const filteredCommandArgs = commandArgs.filter(arg => arg);
+
+  console.log(`[INFO] Executing download command: ${ytDlpPath} ${filteredCommandArgs.join(' ')}`);
 
   try {
-    const { stdout, stderr } = await execAsync(command);
-    console.log(`[INFO] yt-dlp stdout: ${stdout}`);
-    if (stderr) {
-      console.warn(`[WARN] yt-dlp stderr: ${stderr}`);
-    }
-
-    const fileStream = fs.createReadStream(outputFilePath);
-    const fileStats = fs.statSync(outputFilePath);
-
-    res.setHeader('Content-Length', fileStats.size);
-    res.setHeader('Content-Type', type === 'audio' ? 'audio/mpeg' : 'video/mp4');
+    // Set response headers
+    res.setHeader('Content-Type', contentType);
     res.setHeader(
       'Content-Disposition',
-      `attachment; filename="${encodeURIComponent(sanitizedFilename)}.${type === 'audio' ? 'mp3' : 'mp4'}"`
+      `attachment; filename="${encodeURIComponent(sanitizedFilename)}.${fileExtension}"`
     );
 
-    console.log(`[INFO] Starting file transfer: ${outputFilePath}`);
+    // Spawn yt-dlp process and pipe output directly to response
+    const ytDlpProcess = spawn(ytDlpPath, filteredCommandArgs);
 
-    fileStream.pipe(res);
+    ytDlpProcess.stdout.pipe(res);
 
-    fileStream.on('end', () => {
-      console.log(`[INFO] File ${outputFilePath} sent and deleted.`);
-      fs.unlink(outputFilePath, () => {});
+    ytDlpProcess.stderr.on('data', (data) => {
+      console.warn(`[WARN] yt-dlp stderr: ${data.toString()}`);
     });
 
-    fileStream.on('error', (err) => {
-      console.error(`[ERROR] Failed to send file: ${err.message}`);
-      res.status(500).json({ error: 'Failed to send file', details: err.message });
+    ytDlpProcess.on('error', (err) => {
+      console.error(`[ERROR] yt-dlp process error: ${err.message}`);
+      res.status(500).json({ error: 'Download failed', details: err.message });
     });
+
+    ytDlpProcess.on('close', (code) => {
+      if (code !== 0) {
+        console.error(`[ERROR] yt-dlp process exited with code ${code}`);
+        res.status(500).json({ error: 'Download failed', details: `yt-dlp exited with code ${code}` });
+      } else {
+        console.log(`[INFO] Download completed for ${sanitizedFilename}`);
+      }
+    });
+
   } catch (err) {
     console.error(`[ERROR] Download failed: ${err.message}`);
-    console.error(`[ERROR] yt-dlp stderr: ${err.stderr || 'No stderr'}`);
-    res.status(500).json({ error: 'Download failed', details: err.message, stderr: err.stderr || 'No stderr' });
+    res.status(500).json({ error: 'Download failed', details: err.message });
   }
 });
 
