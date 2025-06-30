@@ -37,7 +37,7 @@ const resolveRedirect = async (url) => {
   try {
     const response = await axios.head(url, { maxRedirects: 0, validateStatus: null });
     if (response.status >= 300 && response.status < 400 && response.headers.location) {
-      return await resolveRedirect(response.headers.location); // Follow redirects recursively
+      return response.headers.location;
     }
     return url;
   } catch {
@@ -52,7 +52,7 @@ const estimateFileSize = (bitrateKbps, durationSeconds) => {
   return sizeInMB.toFixed(2) + 'MB';
 };
 
-// 🔥 API Video Info
+// 🔥 API Info Video
 app.post('/api/video-info', async (req, res) => {
   let { url } = req.body;
   if (!url) return res.status(400).json({ error: 'URL diperlukan' });
@@ -69,14 +69,19 @@ app.post('/api/video-info', async (req, res) => {
     const duration = data.duration || 0;
 
     data.formats
-      .filter((f) => f.vcodec !== 'none' && f.acodec !== 'none' && f.ext === 'mp4' && f.height)
+      .filter((f) => f.vcodec !== 'none' && f.height)
       .sort((a, b) => b.height - a.height)
       .forEach((f) => {
         const quality = `${f.height}p`;
         if (!videoQualities.has(quality)) {
-          let size = f.filesize
-            ? (f.filesize / (1024 * 1024)).toFixed(2) + 'MB'
-            : estimateFileSize(f.tbr || 128, duration);
+          let size;
+          if (f.filesize) {
+            size = (f.filesize / (1024 * 1024)).toFixed(2) + 'MB';
+          } else if (f.tbr && duration) {
+            size = estimateFileSize(f.tbr, duration);
+          } else {
+            size = 'Unknown Size';
+          }
 
           formats.push({
             quality,
@@ -90,13 +95,18 @@ app.post('/api/video-info', async (req, res) => {
       });
 
     const bestAudio = data.formats
-      .filter((f) => f.acodec !== 'none' && f.ext === 'm4a')
+      .filter((f) => f.acodec !== 'none')
       .sort((a, b) => (b.abr || 0) - (a.abr || 0) || (b.filesize || 0) - (a.filesize || 0))[0];
 
     if (bestAudio) {
-      let audioSize = bestAudio.filesize
-        ? (bestAudio.filesize / (1024 * 1024)).toFixed(2) + 'MB'
-        : estimateFileSize(bestAudio.abr || 128, duration);
+      let audioSize;
+      if (bestAudio.filesize) {
+        audioSize = (bestAudio.filesize / (1024 * 1024)).toFixed(2) + 'MB';
+      } else if (bestAudio.abr && duration) {
+        audioSize = estimateFileSize(bestAudio.abr, duration);
+      } else {
+        audioSize = 'Unknown Size';
+      }
 
       formats.push({
         quality: 'Best Audio',
@@ -107,73 +117,21 @@ app.post('/api/video-info', async (req, res) => {
       });
     }
 
-    // Select a low-quality MP4 format for preview
     const previewFormat = data.formats.find(
-      (f) =>
-        f.vcodec !== 'none' &&
-        f.acodec !== 'none' &&
-        f.ext === 'mp4' &&
-        f.height <= 360 &&
-        f.url &&
-        f.protocol?.includes('http') // Ensure it's a direct HTTP/HTTPS URL
+      (f) => f.vcodec !== 'none' && f.acodec !== 'none' && f.ext === 'mp4' && f.filesize && f.filesize < 5 * 1024 * 1024
     );
 
-    // Construct the stream URL for the preview
-    const previewUrl = previewFormat
-      ? `/api/stream-preview?url=${encodeURIComponent(previewFormat.url)}`
-      : '';
+    const previewUrl = previewFormat ? previewFormat.url : '';
 
     res.json({
       title: data.title || 'Unknown Title',
       thumbnail: data.thumbnail || '',
-      previewUrl,
+      previewUrl: previewUrl,
       duration: duration ? new Date(duration * 1000).toISOString().substr(11, 8) : '00:00:00',
       formats,
     });
   } catch (err) {
-    console.error('Video info error:', err);
     res.status(500).json({ error: 'Gagal mengambil info video', details: err.message });
-  }
-});
-
-// 🔥 API Stream Preview
-app.get('/api/stream-preview', async (req, res) => {
-  const { url } = req.query;
-  if (!url) return res.status(400).send('URL diperlukan');
-
-  try {
-    const resolvedUrl = await resolveRedirect(decodeURIComponent(url));
-    const response = await axios({
-      method: 'get',
-      url: resolvedUrl,
-      responseType: 'stream',
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Accept': 'video/mp4,video/webm',
-      },
-      timeout: 15000,
-    });
-
-    const contentType = response.headers['content-type'] || 'video/mp4';
-    if (!contentType.includes('video')) {
-      return res.status(400).send('Invalid video content type');
-    }
-
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET');
-    res.setHeader('Content-Type', contentType);
-    res.setHeader('Accept-Ranges', 'bytes');
-
-    response.data.pipe(res);
-
-    response.data.on('error', (err) => {
-      console.error('Stream error:', err);
-      res.status(500).send('Gagal memuat preview');
-    });
-  } catch (err) {
-    console.error('Preview error:', err.message);
-    res.status(500).send('Gagal memuat preview: ' + err.message);
   }
 });
 
@@ -218,6 +176,28 @@ app.post('/api/download', async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: 'Gagal download', details: err.message });
+  }
+});
+
+// 🔥 API Stream Preview
+app.get('/api/stream-preview', async (req, res) => {
+  const { url } = req.query;
+  if (!url) return res.status(400).send('URL diperlukan');
+
+  try {
+    const response = await axios({
+      method: 'get',
+      url,
+      responseType: 'stream',
+      headers: {
+        'User-Agent': 'Mozilla/5.0'
+      }
+    });
+
+    res.setHeader('Content-Type', response.headers['content-type'] || 'video/mp4');
+    response.data.pipe(res);
+  } catch (err) {
+    res.status(500).send('Gagal memuat preview');
   }
 });
 
