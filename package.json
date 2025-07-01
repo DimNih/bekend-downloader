@@ -15,10 +15,12 @@
   },
   "dependencies": {
     "axios": "^1.6.0",
+    "cheerio": "^1.1.0",
     "cors": "^2.8.5",
     "dotenv": "^16.0.3",
     "express": "^4.21.2",
     "googleapis": "^121.0.0",
+    "puppeteer": "^24.11.1",
     "util": "^0.12.5",
     "yt-search": "^2.13.1",
     "ytdl-core": "^4.11.5"

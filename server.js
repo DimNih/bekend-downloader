@@ -6,6 +6,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import axios from 'axios';
+import * as cheerio from 'cheerio';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -79,12 +80,157 @@ const estimateFileSize = (bitrateKbps, durationSeconds) => {
   return sizeInMB.toFixed(2) + 'MB';
 };
 
+const isYouTubeUrl = (url) => {
+  return /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\/.+/.test(url);
+};
+
+const isTikTokUrl = (url) => {
+  return /^(https?:\/\/)?(www\.)?(tiktok\.com|vt\.tiktok\.com)\/.+/.test(url);
+};
+
+// SnapSave Web Scraping for YouTube
+const getSnapSaveVideoInfo = async (url) => {
+  try {
+    const response = await axios.post(
+      'https://snapsave.app/action.php?lang=en',
+      new URLSearchParams({ url }),
+      {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Referer': 'https://snapsave.app/',
+          'Origin': 'https://snapsave.app',
+        },
+      }
+    );
+
+    const $ = cheerio.load(response.data);
+    const title = $('h1.video-title').text().trim() || 'Unknown Title';
+    const thumbnail = $('img.video-thumbnail').attr('src') || '';
+    const duration = $('span.video-duration').text().trim() || '00:00:00';
+
+    const formats = [];
+    $('table.download-table tr').each((_, element) => {
+      const quality = $(element).find('td.quality').text().trim() || 'Unknown';
+      const format = $(element).find('td.format').text().trim() || 'MP4';
+      const size = $(element).find('td.size').text().trim() || 'Unknown Size';
+      const downloadUrl = $(element).find('a.download-link').attr('href');
+      const type = quality.includes('Audio') ? 'audio' : 'video';
+
+      if (downloadUrl) {
+        formats.push({
+          quality: quality.includes('Audio') ? 'Best Audio' : quality,
+          format: type === 'audio' ? 'MP3' : 'MP4',
+          size,
+          url: downloadUrl,
+          type,
+        });
+      }
+    });
+
+    if (formats.length === 0) {
+      throw new Error('No download links found');
+    }
+
+    return {
+      title,
+      thumbnail: await validateThumbnail(thumbnail),
+      duration,
+      formats,
+      previewUrl: formats.find(f => f.type === 'video')?.url || url,
+    };
+  } catch (err) {
+    console.error(`[ERROR] SnapSave scraping failed: ${err.message}`);
+    throw err;
+  }
+};
+
+// SnapTik Web Scraping for TikTok
+const getSnapTikVideoInfo = async (url) => {
+  try {
+    const response = await axios.post(
+      'https://snaptik.app/action.php', // Adjust based on actual SnapTik endpoint
+      new URLSearchParams({ url }),
+      {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Referer': 'https://snaptik.app/',
+          'Origin': 'https://snaptik.app',
+        },
+      }
+    );
+
+    const $ = cheerio.load(response.data);
+    const title = $('h1.video-title').text().trim() || 'Unknown Title';
+    const thumbnail = $('img.video-thumbnail').attr('src') || '';
+    const duration = $('span.video-duration').text().trim() || '00:00:00';
+
+    const formats = [];
+    $('div.download-item').each((_, element) => {
+      const quality = $(element).find('span.quality').text().trim() || 'Unknown';
+      const downloadUrl = $(element).find('a.download-link').attr('href');
+      const type = quality.includes('Audio') ? 'audio' : 'video';
+      const size = $(element).find('span.size').text().trim() || 'Unknown Size';
+
+      if (downloadUrl && downloadUrl.includes('.mp4')) {
+        formats.push({
+          quality: quality.includes('Audio') ? 'Best Audio' : quality || '720p',
+          format: type === 'audio' ? 'MP3' : 'MP4',
+          size,
+          url: downloadUrl,
+          type,
+        });
+      }
+    });
+
+    if (formats.length === 0) {
+      throw new Error('No download links found');
+    }
+
+    return {
+      title,
+      thumbnail: await validateThumbnail(thumbnail),
+      duration,
+      formats,
+      previewUrl: formats.find(f => f.type === 'video')?.url || url,
+    };
+  } catch (err) {
+    console.error(`[ERROR] SnapTik scraping failed: ${err.message}`);
+    throw err;
+  }
+};
+
 // API: Get video info
 app.post('/api/video-info', async (req, res) => {
-  let { url } = req.body; 
+  let { url, platform } = req.body;
   if (!url) return res.status(400).json({ error: 'URL diperlukan' });
 
   url = await resolveRedirect(url);
+
+  // Handle YouTube
+  if (platform === 'youtube' || isYouTubeUrl(url)) {
+    try {
+      const videoInfo = await getSnapSaveVideoInfo(url);
+      console.log(`[INFO] Successfully retrieved SnapSave info: ${videoInfo.title}`);
+      return res.json(videoInfo);
+    } catch (err) {
+      console.error(`[ERROR] SnapSave scraping failed, falling back to yt-dlp: ${err.message}`);
+    }
+  }
+
+  // Handle TikTok
+  if (platform === 'tiktok' || isTikTokUrl(url)) {
+    try {
+      const videoInfo = await getSnapTikVideoInfo(url);
+      console.log(`[INFO] Successfully retrieved SnapTik info: ${videoInfo.title}`);
+      return res.json(videoInfo);
+    } catch (err) {
+      console.error(`[ERROR] SnapTik scraping failed, falling back to yt-dlp: ${err.message}`);
+    }
+  }
+
+  // Fallback to yt-dlp for other platforms or failed scraping
   const cookiesOption = fs.existsSync(COOKIES_PATH) ? `--cookies "${COOKIES_PATH}"` : '';
   const command = `${ytDlpPath} ${cookiesOption} --dump-json --no-warnings "${url}"`;
 
@@ -103,14 +249,14 @@ app.post('/api/video-info', async (req, res) => {
     const videoQualities = new Set();
     const duration = data.duration || 0;
 
-    // Select the best video format for preview (prioritize MP4 with HTTP/HTTPS protocol)
     const bestVideoFormat = data.formats
       .filter(
         (f) =>
           f.vcodec !== 'none' &&
           f.url &&
           f.ext === 'mp4' &&
-          (f.protocol === 'https' || f.protocol === 'http')
+          (f.protocol === 'https' || f.protocol === 'http') &&
+          !f.url.includes('.m3u8') // Prefer non-HLS for preview
       )
       .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
 
@@ -165,10 +311,11 @@ app.post('/api/video-info', async (req, res) => {
 
     res.json({
       title: data.title || 'Unknown Title',
-      thumbnail: await validateThumbnail(data.thumbnail), // Updated to use validateThumbnail
+      thumbnail: await validateThumbnail(data.thumbnail),
       duration: duration ? new Date(duration * 1000).toISOString().substr(11, 8) : '00:00:00',
       formats,
-      previewUrl: bestVideoFormat?.url || data.webpage_url || url, // Fallback to webpage_url if no streamable URL
+      previewUrl: bestVideoFormat?.url || data.webpage_url || url,
+      platform, // Include platform for frontend
     });
   } catch (err) {
     console.error(`[ERROR] Failed to fetch video info: ${err.message}`);
@@ -179,11 +326,75 @@ app.post('/api/video-info', async (req, res) => {
 
 // API: Download video/audio
 app.post('/api/download', async (req, res) => {
-  const { url, filename, type, quality } = req.body;
+  const { url, filename, type, quality, platform } = req.body;
   if (!url || !filename || !type || !quality) {
     return res.status(400).json({ error: 'Parameters url, filename, type, and quality are required' });
   }
 
+  if (platform === 'youtube' || isYouTubeUrl(url)) {
+    try {
+      const videoInfo = await getSnapSaveVideoInfo(url);
+      const format = videoInfo.formats.find((f) => f.type === type && f.quality === quality);
+      if (!format) {
+        return res.status(400).json({ error: `No matching format found for quality: ${quality}` });
+      }
+
+      const response = await axios({
+        url: format.url,
+        method: 'GET',
+        responseType: 'stream',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        },
+      });
+
+      const sanitizedFilename = sanitizeFilename(filename);
+      res.setHeader('Content-Type', type === 'audio' ? 'audio/mpeg' : 'video/mp4');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${encodeURIComponent(sanitizedFilename)}.${type === 'audio' ? 'mp3' : 'mp4'}"`
+      );
+
+      response.data.pipe(res);
+      console.log(`[INFO] Streaming SnapSave file: ${sanitizedFilename}`);
+    } catch (err) {
+      console.error(`[ERROR] SnapSave download failed: ${err.message}`);
+    }
+  }
+
+  if (platform === 'tiktok' || isTikTokUrl(url)) {
+    try {
+      const videoInfo = await getSnapTikVideoInfo(url);
+      const format = videoInfo.formats.find((f) => f.type === type && f.quality === quality);
+      if (!format) {
+        return res.status(400).json({ error: `No matching format found for quality: ${quality}` });
+      }
+
+      const response = await axios({
+        url: format.url,
+        method: 'GET',
+        responseType: 'stream',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+          'Referer': 'https://www.tiktok.com/',
+        },
+      });
+
+      const sanitizedFilename = sanitizeFilename(filename);
+      res.setHeader('Content-Type', type === 'audio' ? 'audio/mpeg' : 'video/mp4');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${encodeURIComponent(sanitizedFilename)}.${type === 'audio' ? 'mp3' : 'mp4'}"`
+      );
+
+      response.data.pipe(res);
+      console.log(`[INFO] Streaming SnapTik file: ${sanitizedFilename}`);
+    } catch (err) {
+      console.error(`[ERROR] SnapTik download failed: ${err.message}`);
+    }
+  }
+
+  // Fallback to yt-dlp
   const sanitizedFilename = sanitizeFilename(filename);
   const outputFilePath = path.join(
     DOWNLOADS_DIR,
