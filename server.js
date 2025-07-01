@@ -7,6 +7,9 @@ import { fileURLToPath } from 'url';
 import fs from 'fs';
 import axios from 'axios';
 import { load } from 'cheerio';
+import dotenv from 'dotenv';
+
+dotenv.config(); // Load environment variables from .env file
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -18,6 +21,7 @@ app.use(express.urlencoded({ extended: true }));
 
 const DOWNLOADS_DIR = path.join('/tmp', 'downloads');
 const ytDlpPath = 'yt-dlp';
+const proxy = process.env.PROXY_URL || ''; // Get proxy from environment variable
 
 if (!fs.existsSync(DOWNLOADS_DIR)) {
   fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
@@ -95,12 +99,13 @@ const getSaveFromVideoInfo = async (url) => {
           'Referer': 'https://www.savefrom.net/',
           'Origin': 'https://www.savefrom.net',
         },
+        timeout: 10000,
       }
     );
 
     const data = response.data;
     if (!data || !data.url || data.status !== 'success') {
-      throw new Error('No valid download links found');
+      throw new Error('No valid download links found from SaveFrom.net');
     }
 
     const title = data.meta?.title || 'Unknown Title';
@@ -146,7 +151,8 @@ app.post('/api/video-info', async (req, res) => {
     }
   }
 
-  const command = `${ytDlpPath} --dump-json --no-warnings "${url}"`;
+  const proxyOption = proxy ? `--proxy "${proxy}"` : '';
+  const command = `${ytDlpPath} --dump-json --no-warnings ${proxyOption} "${url}"`;
   console.log(`[INFO] Executing command: ${command}`);
 
   try {
@@ -294,10 +300,11 @@ app.post('/api/download', async (req, res) => {
     `${sanitizedFilename}.${type === 'audio' ? 'mp3' : 'mp4'}`
   );
 
+  const proxyOption = proxy ? `--proxy "${proxy}"` : '';
   const command =
     type === 'audio'
-      ? `${ytDlpPath} --extract-audio --audio-format mp3 -o "${outputFilePath}" "${url}"`
-      : `${ytDlpPath} -f "best[height<=${parseInt(quality)}][ext=mp4]/best[ext=mp4]/best" --merge-output-format mp4 -o "${outputFilePath}" "${url}"`;
+      ? `${ytDlpPath} --extract-audio --audio-format mp3 ${proxyOption} -o "${outputFilePath}" "${url}"`
+      : `${ytDlpPath} -f "best[height<=${parseInt(quality)}][ext=mp4]/best[ext=mp4]/best" --merge-output-format mp4 ${proxyOption} -o "${outputFilePath}" "${url}"`;
 
   console.log(`[INFO] Executing download command: ${command}`);
 
