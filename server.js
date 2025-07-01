@@ -188,7 +188,7 @@ app.post('/api/video-info', async (req, res) => {
       .filter((f) => f.vcodec !== 'none' && f.height)
       .sort((a, b) => b.height - a.height)
       .forEach((f) => {
-        const quality = `${f.height p}`;
+        const quality = `${f.height}p`;
         if (!videoQualities.has(quality)) {
           let size;
           if (f.filesize) {
