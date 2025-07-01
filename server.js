@@ -6,9 +6,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import axios from 'axios';
-import dotenv from 'dotenv';
-
-dotenv.config();
+import { load } from 'cheerio';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -20,7 +18,6 @@ app.use(express.urlencoded({ extended: true }));
 
 const DOWNLOADS_DIR = path.join('/tmp', 'downloads');
 const ytDlpPath = 'yt-dlp';
-const proxies = process.env.PROXY_URLS ? process.env.PROXY_URLS.split(',') : ['http://103.154.87.12:80'];
 
 if (!fs.existsSync(DOWNLOADS_DIR)) {
   fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
@@ -86,29 +83,58 @@ const isYouTubeUrl = (url) => {
   return /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\/.+/.test(url);
 };
 
-const tryYtDlpWithProxies = async (url, maxRetries = 3) => {
-  for (let i = 0; i < proxies.length; i++) {
-    const proxy = proxies[i];
-    console.log(`[INFO] Attempting with proxy: ${proxy}`);
-    const proxyOption = proxy ? `--proxy "${proxy}"` : '';
-    const command = `${ytDlpPath} --dump-json --no-warnings --extractor-args "youtube:player_client=android_vr,default" ${proxyOption} "${url}"`;
-    console.log(`[INFO] Executing command: ${command}`);
-
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        const { stdout, stderr } = await execAsync(command, { maxBuffer: 1024 * 1024 * 20 });
-        if (stderr) console.warn(`[WARN] yt-dlp stderr: ${stderr}`);
-        return JSON.parse(stdout);
-      } catch (err) {
-        console.error(`[ERROR] Attempt ${attempt}/${maxRetries} with proxy ${proxy} failed: ${err.message}`);
-        if (attempt === maxRetries && i === proxies.length - 1) {
-          throw err;
-        }
-        await new Promise(resolve => setTimeout(resolve, 1000)); // Delay before retry
+const getSnapSaveVideoInfo = async (url) => {
+  try {
+    const response = await axios.post(
+      'https://snapsave.app/action.php?lang=en',
+      new URLSearchParams({ url }),
+      {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Referer': 'https://snapsave.app/',
+          'Origin': 'https://snapsave.app',
+        },
       }
-    }
+    );
+
+    const $ = load(response.data);
+    const title = $('h1.video-title').text().trim() || 'Unknown Title';
+    const thumbnail = $('img.video-thumbnail').attr('src') || '';
+    const duration = $('span.video-duration').text().trim() || '00:00:00';
+
+    const formats = [];
+    $('table.download-table tr').each((_, element) => {
+      const quality = $(element).find('td.quality').text().trim() || 'Unknown';
+      const format = $(element).find('td.format').text().trim() || 'MP4';
+      const size = $(element).find('td.size').text().trim() || 'Unknown Size';
+      const downloadUrl = $(element).find('a.download-link').attr('href');
+      const type = quality.includes('Audio') ? 'audio' : 'video';
+
+      if (downloadUrl) {
+        formats.push({
+          quality: quality.includes('Audio') ? 'Best Audio' : quality,
+          format: type === 'audio' ? 'MP3' : 'MP4',
+          size,
+          url: downloadUrl,
+          type,
+        });
+      }
+    });
+
+    if (formats.length === 0) throw new Error('No download links found');
+
+    return {
+      title,
+      thumbnail: await validateThumbnail(thumbnail),
+      duration,
+      formats,
+      previewUrl: formats.find((f) => f.type === 'video')?.url || url,
+    };
+  } catch (err) {
+    console.error(`[ERROR] SnapSave scraping failed: ${err.message}`);
+    throw err;
   }
-  throw new Error('All proxies failed to fetch video info');
 };
 
 app.post('/api/video-info', async (req, res) => {
@@ -117,9 +143,26 @@ app.post('/api/video-info', async (req, res) => {
 
   url = await resolveRedirect(url);
 
+  if (platform === 'youtube' || isYouTubeUrl(url)) {
+    try {
+      const videoInfo = await getSnapSaveVideoInfo(url);
+      console.log(`[INFO] Successfully retrieved SnapSave info: ${videoInfo.title}`);
+      return res.json(videoInfo);
+    } catch (err) {
+      console.error(`[ERROR] SnapSave scraping failed, falling back to yt-dlp: ${err.message}`);
+    }
+  }
+
+  const command = `${ytDlpPath} --dump-json --no-warnings "${url}"`;
+  console.log(`[INFO] Executing command: ${command}`);
+
   try {
-    const data = await tryYtDlpWithProxies(url);
+    const { stdout, stderr } = await execAsync(command, { maxBuffer: 1024 * 1024 * 20 });
+    if (stderr) console.warn(`[WARN] yt-dlp stderr: ${stderr}`);
+    const data = JSON.parse(stdout);
+
     console.log(`[INFO] Successfully retrieved info: ${data.title}`);
+    console.log('Extracted data:', JSON.stringify(data, null, 2));
 
     const formats = [];
     const videoQualities = new Set();
@@ -219,44 +262,57 @@ app.post('/api/download', async (req, res) => {
     return res.status(400).json({ error: 'Parameters url, filename, type, and quality are required' });
   }
 
+  if (platform === 'youtube' || isYouTubeUrl(url)) {
+    try {
+      const videoInfo = await getSnapSaveVideoInfo(url);
+      const format = videoInfo.formats.find((f) => f.type === type && f.quality === quality);
+      if (!format) {
+        return res.status(400).json({ error: `No matching format found for quality: ${quality}` });
+      }
+
+      const response = await axios({
+        url: format.url,
+        method: 'GET',
+        responseType: 'stream',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        },
+      });
+
+      const sanitizedFilename = sanitizeFilename(filename);
+      res.setHeader('Content-Type', type === 'audio' ? 'audio/mpeg' : 'video/mp4');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${encodeURIComponent(sanitizedFilename)}.${type === 'audio' ? 'mp3' : 'mp4'}"`
+      );
+
+      response.data.pipe(res);
+      console.log(`[INFO] Streaming SnapSave file: ${sanitizedFilename}`);
+    } catch (err) {
+      console.error(`[ERROR] SnapSave download failed: ${err.message}`);
+      res.status(500).json({ error: 'Download failed', details: err.message });
+    }
+    return;
+  }
+
   const sanitizedFilename = sanitizeFilename(filename);
   const outputFilePath = path.join(
     DOWNLOADS_DIR,
     `${sanitizedFilename}.${type === 'audio' ? 'mp3' : 'mp4'}`
   );
 
-  const tryDownloadWithProxies = async (maxRetries = 3) => {
-    for (let i = 0; i < proxies.length; i++) {
-      const proxy = proxies[i];
-      console.log(`[INFO] Attempting download with proxy: ${proxy}`);
-      const proxyOption = proxy ? `--proxy "${proxy}"` : '';
-      const command =
-        type === 'audio'
-          ? `${ytDlpPath} --extract-audio --audio-format mp3 --extractor-args "youtube:player_client=android_vr,default" ${proxyOption} -o "${outputFilePath}" "${url}"`
-          : `${ytDlpPath} -f "best[height<=${parseInt(quality)}][ext=mp4]/best[ext=mp4]/best" --merge-output-format mp4 --extractor-args "youtube:player_client=android_vr,default" ${proxyOption} -o "${outputFilePath}" "${url}"`;
+  const command =
+    type === 'audio'
+      ? `${ytDlpPath} --extract-audio --audio-format mp3 -o "${outputFilePath}" "${url}"`
+      : `${ytDlpPath} -f "best[height<=${parseInt(quality)}][ext=mp4]/best[ext=mp4]/best" --merge-output-format mp4 -o "${outputFilePath}" "${url}"`;
 
-      console.log(`[INFO] Executing download command: ${command}`);
-
-      for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        try {
-          const { stdout, stderr } = await execAsync(command);
-          console.log(`[INFO] yt-dlp stdout: ${stdout}`);
-          if (stderr) console.warn(`[WARN] yt-dlp stderr: ${stderr}`);
-          return true;
-        } catch (err) {
-          console.error(`[ERROR] Attempt ${attempt}/${maxRetries} with proxy ${proxy} failed: ${err.message}`);
-          if (attempt === maxRetries && i === proxies.length - 1) {
-            throw err;
-          }
-          await new Promise(resolve => setTimeout(resolve, 1000));
-        }
-      }
-    }
-    throw new Error('All proxies failed to download video');
-  };
+  console.log(`[INFO] Executing download command: ${command}`);
 
   try {
-    await tryDownloadWithProxies();
+    const { stdout, stderr } = await execAsync(command);
+    console.log(`[INFO] yt-dlp stdout: ${stdout}`);
+    if (stderr) console.warn(`[WARN] yt-dlp stderr: ${stderr}`);
+
     const fileStream = fs.createReadStream(outputFilePath);
     const fileStats = fs.statSync(outputFilePath);
 
