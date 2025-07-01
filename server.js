@@ -6,7 +6,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import axios from 'axios';
-import cheerio from 'cheerio';
+import { load } from 'cheerio';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -99,7 +99,7 @@ const getSnapSaveVideoInfo = async (url) => {
       }
     );
 
-    const $ = cheerio.load(response.data);
+    const $ = load(response.data);
 
     const title = $('h1.video-title').text().trim() || 'Unknown Title';
     const thumbnail = $('img.video-thumbnail').attr('src') || '';
@@ -111,7 +111,7 @@ const getSnapSaveVideoInfo = async (url) => {
       const format = $(element).find('td.format').text().trim() || 'MP4';
       const size = $(element).find('td.size').text().trim() || 'Unknown Size';
       const downloadUrl = $(element).find('a.download-link').attr('href');
-      const type = quality.includes('Audio') ? '-audio' : 'video';
+      const type = quality.includes('Audio') ? 'audio' : 'video';
 
       if (downloadUrl) {
         formats.push({
@@ -202,7 +202,7 @@ app.post('/api/video-info', async (req, res) => {
 
           formats.push({
             quality,
-            format: 'MP4',
+            format: 'vet',
             size,
             url: data.webpage_url || url,
             type: 'video',
