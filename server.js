@@ -6,7 +6,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import axios from 'axios';
-import cheerio from 'cheerio';
+import { load } from 'cheerio';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -18,7 +18,6 @@ app.use(express.urlencoded({ extended: true }));
 
 const DOWNLOADS_DIR = path.join('/tmp', 'downloads');
 const ytDlpPath = 'yt-dlp';
-const COOKIES_PATH = path.join(__dirname, 'youtube.com_cookies.txt');
 
 if (!fs.existsSync(DOWNLOADS_DIR)) {
   fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
@@ -84,13 +83,11 @@ const isYouTubeUrl = (url) => {
   return /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\/.+/.test(url);
 };
 
-// SnapSave Web Scraping
 const getSnapSaveVideoInfo = async (url) => {
   try {
-    // Send POST request to SnapSave
     const response = await axios.post(
-      'https://snapsave.app/action.php?lang=en', // Adjust based on actual form action URL
-      new URLSearchParams({ url }), // Mimic form submission
+      'https://snapsave.app/action.php?lang=en',
+      new URLSearchParams({ url }),
       {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
@@ -101,15 +98,11 @@ const getSnapSaveVideoInfo = async (url) => {
       }
     );
 
-    // Parse HTML with cheerio
-    const $ = cheerio.load(response.data);
-
-    // Extract video info (adjust selectors based on actual SnapSave HTML structure)
+    const $ = load(response.data);
     const title = $('h1.video-title').text().trim() || 'Unknown Title';
     const thumbnail = $('img.video-thumbnail').attr('src') || '';
     const duration = $('span.video-duration').text().trim() || '00:00:00';
 
-    // Extract download links
     const formats = [];
     $('table.download-table tr').each((_, element) => {
       const quality = $(element).find('td.quality').text().trim() || 'Unknown';
@@ -129,16 +122,14 @@ const getSnapSaveVideoInfo = async (url) => {
       }
     });
 
-    if (formats.length === 0) {
-      throw new Error('No download links found');
-    }
+    if (formats.length === 0) throw new Error('No download links found');
 
     return {
       title,
       thumbnail: await validateThumbnail(thumbnail),
       duration,
       formats,
-      previewUrl: formats.find(f => f.type === 'video')?.url || url,
+      previewUrl: formats.find((f) => f.type === 'video')?.url || url,
     };
   } catch (err) {
     console.error(`[ERROR] SnapSave scraping failed: ${err.message}`);
@@ -146,7 +137,6 @@ const getSnapSaveVideoInfo = async (url) => {
   }
 };
 
-// API: Get video info
 app.post('/api/video-info', async (req, res) => {
   let { url, platform } = req.body;
   if (!url) return res.status(400).json({ error: 'URL diperlukan' });
@@ -160,38 +150,46 @@ app.post('/api/video-info', async (req, res) => {
       return res.json(videoInfo);
     } catch (err) {
       console.error(`[ERROR] SnapSave scraping failed, falling back to yt-dlp: ${err.message}`);
-      // Fall back to yt-dlp
     }
   }
 
-  // Existing yt-dlp logic for non-YouTube platforms
-  const cookiesOption = fs.existsSync(COOKIES_PATH) ? `--cookies "${COOKIES_PATH}"` : '';
-  const command = `${ytDlpPath} ${cookiesOption} --dump-json --no-warnings "${url}"`;
-
+  const command = `${ytDlpPath} --dump-json --no-warnings "${url}"`;
   console.log(`[INFO] Executing command: ${command}`);
 
   try {
     const { stdout, stderr } = await execAsync(command, { maxBuffer: 1024 * 1024 * 20 });
-    if (stderr) {
-      console.warn(`[WARN] yt-dlp stderr: ${stderr}`);
-    }
+    if (stderr) console.warn(`[WARN] yt-dlp stderr: ${stderr}`);
     const data = JSON.parse(stdout);
 
     console.log(`[INFO] Successfully retrieved info: ${data.title}`);
+    console.log('Extracted data:', JSON.stringify(data, null, 2));
 
     const formats = [];
     const videoQualities = new Set();
     const duration = data.duration || 0;
 
-    const bestVideoFormat = data.formats
-      .filter(
-        (f) =>
-          f.vcodec !== 'none' &&
-          f.url &&
-          f.ext === 'mp4' &&
-          (f.protocol === 'https' || f.protocol === 'http')
-      )
-      .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+    const bestVideoFormat =
+      data.formats
+        .filter(
+          (f) =>
+            f.vcodec !== 'none' &&
+            f.acodec !== 'none' &&
+            f.url &&
+            f.ext === 'mp4' &&
+            (f.protocol === 'https' || f.protocol === 'http')
+        )
+        .sort((a, b) => (b.height || 0) - (a.height || 0))[0] ||
+      data.formats
+        .filter(
+          (f) =>
+            f.vcodec !== 'none' &&
+            f.url &&
+            f.ext === 'mp4' &&
+            (f.protocol === 'https' || f.protocol === 'http')
+        )
+        .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+
+    console.log('Best video format:', bestVideoFormat);
 
     data.formats
       .filter((f) => f.vcodec !== 'none' && f.height)
@@ -212,7 +210,7 @@ app.post('/api/video-info', async (req, res) => {
             quality,
             format: 'MP4',
             size,
-            url: data.webpage_url || url,
+            url: f.url || data.webpage_url || url,
             type: 'video',
           });
           videoQualities.add(quality);
@@ -237,17 +235,19 @@ app.post('/api/video-info', async (req, res) => {
         quality: 'Best Audio',
         format: 'MP3',
         size: audioSize,
-        url: data.webpage_url || url,
+        url: bestAudio.url || data.webpage_url || url,
         type: 'audio',
       });
     }
 
+    const thumbnail = data.thumbnail || (data.thumbnails && data.thumbnails[0]?.url) || '';
+
     res.json({
       title: data.title || 'Unknown Title',
-      thumbnail: await validateThumbnail(data.thumbnail),
+      thumbnail: await validateThumbnail(thumbnail),
       duration: duration ? new Date(duration * 1000).toISOString().substr(11, 8) : '00:00:00',
       formats,
-      previewUrl: bestVideoFormat?.url || data.webpage_url || url,
+      previewUrl: bestVideoFormat?.url || data.url || data.webpage_url || url,
     });
   } catch (err) {
     console.error(`[ERROR] Failed to fetch video info: ${err.message}`);
@@ -256,7 +256,6 @@ app.post('/api/video-info', async (req, res) => {
   }
 });
 
-// API: Download video/audio
 app.post('/api/download', async (req, res) => {
   const { url, filename, type, quality, platform } = req.body;
   if (!url || !filename || !type || !quality) {
@@ -291,30 +290,28 @@ app.post('/api/download', async (req, res) => {
       console.log(`[INFO] Streaming SnapSave file: ${sanitizedFilename}`);
     } catch (err) {
       console.error(`[ERROR] SnapSave download failed: ${err.message}`);
-      // Fall back to yt-dlp
+      res.status(500).json({ error: 'Download failed', details: err.message });
     }
+    return;
   }
 
-  // Existing yt-dlp logic for non-YouTube platforms
   const sanitizedFilename = sanitizeFilename(filename);
   const outputFilePath = path.join(
     DOWNLOADS_DIR,
     `${sanitizedFilename}.${type === 'audio' ? 'mp3' : 'mp4'}`
   );
 
-  const cookiesOption = fs.existsSync(COOKIES_PATH) ? `--cookies "${COOKIES_PATH}"` : '';
-  const command = type === 'audio'
-    ? `${ytDlpPath} ${cookiesOption} --extract-audio --audio-format mp3 -o "${outputFilePath}" "${url}"`
-    : `${ytDlpPath} ${cookiesOption} -f "best[height<=${parseInt(quality)}][ext=mp4]/best[ext=mp4]/best" --merge-output-format mp4 -o "${outputFilePath}" "${url}"`;
+  const command =
+    type === 'audio'
+      ? `${ytDlpPath} --extract-audio --audio-format mp3 -o "${outputFilePath}" "${url}"`
+      : `${ytDlpPath} -f "best[height<=${parseInt(quality)}][ext=mp4]/best[ext=mp4]/best" --merge-output-format mp4 -o "${outputFilePath}" "${url}"`;
 
   console.log(`[INFO] Executing download command: ${command}`);
 
   try {
     const { stdout, stderr } = await execAsync(command);
     console.log(`[INFO] yt-dlp stdout: ${stdout}`);
-    if (stderr) {
-      console.warn(`[WARN] yt-dlp stderr: ${stderr}`);
-    }
+    if (stderr) console.warn(`[WARN] yt-dlp stderr: ${stderr}`);
 
     const fileStream = fs.createReadStream(outputFilePath);
     const fileStats = fs.statSync(outputFilePath);
@@ -346,7 +343,6 @@ app.post('/api/download', async (req, res) => {
   }
 });
 
-// Start server
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`🚀 Server running at http://localhost:${PORT}`);
