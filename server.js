@@ -6,7 +6,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import axios from 'axios';
-import * as cheerio from 'cheerio';
+import cheerio from 'cheerio';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -18,7 +18,6 @@ app.use(express.urlencoded({ extended: true }));
 
 const DOWNLOADS_DIR = path.join('/tmp', 'downloads');
 const ytDlpPath = 'yt-dlp';
-const COOKIES_PATH = path.join(__dirname, 'youtube.com_cookies.txt');
 
 if (!fs.existsSync(DOWNLOADS_DIR)) {
   fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
@@ -84,11 +83,7 @@ const isYouTubeUrl = (url) => {
   return /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\/.+/.test(url);
 };
 
-const isTikTokUrl = (url) => {
-  return /^(https?:\/\/)?(www\.)?(tiktok\.com|vt\.tiktok\.com)\/.+/.test(url);
-};
-
-// SnapSave Web Scraping for YouTube
+// SnapSave Web Scraping
 const getSnapSaveVideoInfo = async (url) => {
   try {
     const response = await axios.post(
@@ -105,6 +100,7 @@ const getSnapSaveVideoInfo = async (url) => {
     );
 
     const $ = cheerio.load(response.data);
+
     const title = $('h1.video-title').text().trim() || 'Unknown Title';
     const thumbnail = $('img.video-thumbnail').attr('src') || '';
     const duration = $('span.video-duration').text().trim() || '00:00:00';
@@ -115,7 +111,7 @@ const getSnapSaveVideoInfo = async (url) => {
       const format = $(element).find('td.format').text().trim() || 'MP4';
       const size = $(element).find('td.size').text().trim() || 'Unknown Size';
       const downloadUrl = $(element).find('a.download-link').attr('href');
-      const type = quality.includes('Audio') ? 'audio' : 'video';
+      const type = quality.includes('Audio') ? '-audio' : 'video';
 
       if (downloadUrl) {
         formats.push({
@@ -145,62 +141,6 @@ const getSnapSaveVideoInfo = async (url) => {
   }
 };
 
-// SnapTik Web Scraping for TikTok
-const getSnapTikVideoInfo = async (url) => {
-  try {
-    const response = await axios.post(
-      'https://snaptik.app/action.php', // Adjust based on actual SnapTik endpoint
-      new URLSearchParams({ url }),
-      {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'Referer': 'https://snaptik.app/',
-          'Origin': 'https://snaptik.app',
-        },
-      }
-    );
-
-    const $ = cheerio.load(response.data);
-    const title = $('h1.video-title').text().trim() || 'Unknown Title';
-    const thumbnail = $('img.video-thumbnail').attr('src') || '';
-    const duration = $('span.video-duration').text().trim() || '00:00:00';
-
-    const formats = [];
-    $('div.download-item').each((_, element) => {
-      const quality = $(element).find('span.quality').text().trim() || 'Unknown';
-      const downloadUrl = $(element).find('a.download-link').attr('href');
-      const type = quality.includes('Audio') ? 'audio' : 'video';
-      const size = $(element).find('span.size').text().trim() || 'Unknown Size';
-
-      if (downloadUrl && downloadUrl.includes('.mp4')) {
-        formats.push({
-          quality: quality.includes('Audio') ? 'Best Audio' : quality || '720p',
-          format: type === 'audio' ? 'MP3' : 'MP4',
-          size,
-          url: downloadUrl,
-          type,
-        });
-      }
-    });
-
-    if (formats.length === 0) {
-      throw new Error('No download links found');
-    }
-
-    return {
-      title,
-      thumbnail: await validateThumbnail(thumbnail),
-      duration,
-      formats,
-      previewUrl: formats.find(f => f.type === 'video')?.url || url,
-    };
-  } catch (err) {
-    console.error(`[ERROR] SnapTik scraping failed: ${err.message}`);
-    throw err;
-  }
-};
-
 // API: Get video info
 app.post('/api/video-info', async (req, res) => {
   let { url, platform } = req.body;
@@ -208,7 +148,6 @@ app.post('/api/video-info', async (req, res) => {
 
   url = await resolveRedirect(url);
 
-  // Handle YouTube
   if (platform === 'youtube' || isYouTubeUrl(url)) {
     try {
       const videoInfo = await getSnapSaveVideoInfo(url);
@@ -219,20 +158,7 @@ app.post('/api/video-info', async (req, res) => {
     }
   }
 
-  // Handle TikTok
-  if (platform === 'tiktok' || isTikTokUrl(url)) {
-    try {
-      const videoInfo = await getSnapTikVideoInfo(url);
-      console.log(`[INFO] Successfully retrieved SnapTik info: ${videoInfo.title}`);
-      return res.json(videoInfo);
-    } catch (err) {
-      console.error(`[ERROR] SnapTik scraping failed, falling back to yt-dlp: ${err.message}`);
-    }
-  }
-
-  // Fallback to yt-dlp for other platforms or failed scraping
-  const cookiesOption = fs.existsSync(COOKIES_PATH) ? `--cookies "${COOKIES_PATH}"` : '';
-  const command = `${ytDlpPath} ${cookiesOption} --dump-json --no-warnings "${url}"`;
+  const command = `${ytDlpPath} --dump-json --no-warnings "${url}"`;
 
   console.log(`[INFO] Executing command: ${command}`);
 
@@ -255,8 +181,7 @@ app.post('/api/video-info', async (req, res) => {
           f.vcodec !== 'none' &&
           f.url &&
           f.ext === 'mp4' &&
-          (f.protocol === 'https' || f.protocol === 'http') &&
-          !f.url.includes('.m3u8') // Prefer non-HLS for preview
+          (f.protocol === 'https' || f.protocol === 'http')
       )
       .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
 
@@ -315,7 +240,6 @@ app.post('/api/video-info', async (req, res) => {
       duration: duration ? new Date(duration * 1000).toISOString().substr(11, 8) : '00:00:00',
       formats,
       previewUrl: bestVideoFormat?.url || data.webpage_url || url,
-      platform, // Include platform for frontend
     });
   } catch (err) {
     console.error(`[ERROR] Failed to fetch video info: ${err.message}`);
@@ -362,49 +286,15 @@ app.post('/api/download', async (req, res) => {
     }
   }
 
-  if (platform === 'tiktok' || isTikTokUrl(url)) {
-    try {
-      const videoInfo = await getSnapTikVideoInfo(url);
-      const format = videoInfo.formats.find((f) => f.type === type && f.quality === quality);
-      if (!format) {
-        return res.status(400).json({ error: `No matching format found for quality: ${quality}` });
-      }
-
-      const response = await axios({
-        url: format.url,
-        method: 'GET',
-        responseType: 'stream',
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-          'Referer': 'https://www.tiktok.com/',
-        },
-      });
-
-      const sanitizedFilename = sanitizeFilename(filename);
-      res.setHeader('Content-Type', type === 'audio' ? 'audio/mpeg' : 'video/mp4');
-      res.setHeader(
-        'Content-Disposition',
-        `attachment; filename="${encodeURIComponent(sanitizedFilename)}.${type === 'audio' ? 'mp3' : 'mp4'}"`
-      );
-
-      response.data.pipe(res);
-      console.log(`[INFO] Streaming SnapTik file: ${sanitizedFilename}`);
-    } catch (err) {
-      console.error(`[ERROR] SnapTik download failed: ${err.message}`);
-    }
-  }
-
-  // Fallback to yt-dlp
   const sanitizedFilename = sanitizeFilename(filename);
   const outputFilePath = path.join(
     DOWNLOADS_DIR,
     `${sanitizedFilename}.${type === 'audio' ? 'mp3' : 'mp4'}`
   );
 
-  const cookiesOption = fs.existsSync(COOKIES_PATH) ? `--cookies "${COOKIES_PATH}"` : '';
   const command = type === 'audio'
-    ? `${ytDlpPath} ${cookiesOption} --extract-audio --audio-format mp3 -o "${outputFilePath}" "${url}"`
-    : `${ytDlpPath} ${cookiesOption} -f "best[height<=${parseInt(quality)}][ext=mp4]/best[ext=mp4]/best" --merge-output-format mp4 -o "${outputFilePath}" "${url}"`;
+    ? `${ytDlpPath} --extract-audio --audio-format mp3 -o "${outputFilePath}" "${url}"`
+    : `${ytDlpPath} -f "best[height<=${parseInt(quality)}][ext=mp4]/best[ext=mp4]/best" --merge-output-format mp4 -o "${outputFilePath}" "${url}"`;
 
   console.log(`[INFO] Executing download command: ${command}`);
 
