@@ -83,44 +83,37 @@ const isYouTubeUrl = (url) => {
   return /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\/.+/.test(url);
 };
 
-const getSnapSaveVideoInfo = async (url) => {
+const getSaveFromVideoInfo = async (url) => {
   try {
     const response = await axios.post(
-      'https://snapsave.app/action.php?lang=en',
-      new URLSearchParams({ url }),
+      'https://www.savefrom.net/api/convert/',
+      { url },
       {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'Referer': 'https://snapsave.app/',
-          'Origin': 'https://snapsave.app',
+          'Content-Type': 'application/json',
+          'Referer': 'https://www.savefrom.net/',
+          'Origin': 'https://www.savefrom.net',
         },
       }
     );
 
-    const $ = load(response.data);
-    const title = $('h1.video-title').text().trim() || 'Unknown Title';
-    const thumbnail = $('img.video-thumbnail').attr('src') || '';
-    const duration = $('span.video-duration').text().trim() || '00:00:00';
+    const data = response.data;
+    if (!data || !data.url || data.status !== 'success') {
+      throw new Error('No valid download links found');
+    }
 
-    const formats = [];
-    $('table.download-table tr').each((_, element) => {
-      const quality = $(element).find('td.quality').text().trim() || 'Unknown';
-      const format = $(element).find('td.format').text().trim() || 'MP4';
-      const size = $(element).find('td.size').text().trim() || 'Unknown Size';
-      const downloadUrl = $(element).find('a.download-link').attr('href');
-      const type = quality.includes('Audio') ? 'audio' : 'video';
+    const title = data.meta?.title || 'Unknown Title';
+    const thumbnail = data.meta?.thumbnail || '';
+    const duration = data.meta?.duration || '00:00:00';
 
-      if (downloadUrl) {
-        formats.push({
-          quality: quality.includes('Audio') ? 'Best Audio' : quality,
-          format: type === 'audio' ? 'MP3' : 'MP4',
-          size,
-          url: downloadUrl,
-          type,
-        });
-      }
-    });
+    const formats = data.url.map((item) => ({
+      quality: item.quality || 'Unknown',
+      format: item.type === 'audio' ? 'MP3' : 'MP4',
+      size: item.size ? (item.size / (1024 * 1024)).toFixed(2) + 'MB' : 'Unknown Size',
+      url: item.url,
+      type: item.type === 'audio' ? 'audio' : 'video',
+    }));
 
     if (formats.length === 0) throw new Error('No download links found');
 
@@ -132,7 +125,7 @@ const getSnapSaveVideoInfo = async (url) => {
       previewUrl: formats.find((f) => f.type === 'video')?.url || url,
     };
   } catch (err) {
-    console.error(`[ERROR] SnapSave scraping failed: ${err.message}`);
+    console.error(`[ERROR] SaveFrom.net scraping failed: ${err.message}`);
     throw err;
   }
 };
@@ -145,11 +138,11 @@ app.post('/api/video-info', async (req, res) => {
 
   if (platform === 'youtube' || isYouTubeUrl(url)) {
     try {
-      const videoInfo = await getSnapSaveVideoInfo(url);
-      console.log(`[INFO] Successfully retrieved SnapSave info: ${videoInfo.title}`);
+      const videoInfo = await getSaveFromVideoInfo(url);
+      console.log(`[INFO] Successfully retrieved SaveFrom.net info: ${videoInfo.title}`);
       return res.json(videoInfo);
     } catch (err) {
-      console.error(`[ERROR] SnapSave scraping failed, falling back to yt-dlp: ${err.message}`);
+      console.error(`[ERROR] SaveFrom.net scraping failed, falling back to yt-dlp: ${err.message}`);
     }
   }
 
@@ -195,7 +188,7 @@ app.post('/api/video-info', async (req, res) => {
       .filter((f) => f.vcodec !== 'none' && f.height)
       .sort((a, b) => b.height - a.height)
       .forEach((f) => {
-        const quality = `${f.height}p`;
+        const quality = `${f.height p}`;
         if (!videoQualities.has(quality)) {
           let size;
           if (f.filesize) {
@@ -264,7 +257,7 @@ app.post('/api/download', async (req, res) => {
 
   if (platform === 'youtube' || isYouTubeUrl(url)) {
     try {
-      const videoInfo = await getSnapSaveVideoInfo(url);
+      const videoInfo = await getSaveFromVideoInfo(url);
       const format = videoInfo.formats.find((f) => f.type === type && f.quality === quality);
       if (!format) {
         return res.status(400).json({ error: `No matching format found for quality: ${quality}` });
@@ -287,9 +280,9 @@ app.post('/api/download', async (req, res) => {
       );
 
       response.data.pipe(res);
-      console.log(`[INFO] Streaming SnapSave file: ${sanitizedFilename}`);
+      console.log(`[INFO] Streaming SaveFrom.net file: ${sanitizedFilename}`);
     } catch (err) {
-      console.error(`[ERROR] SnapSave download failed: ${err.message}`);
+      console.error(`[ERROR] SaveFrom.net download failed: ${err.message}`);
       res.status(500).json({ error: 'Download failed', details: err.message });
     }
     return;
